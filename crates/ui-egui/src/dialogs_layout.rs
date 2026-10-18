@@ -153,30 +153,52 @@ pub struct PageNumFormatForm {
     /// Start numbering at `start`; off continues the previous section's numbering.
     pub start_at: bool,
     pub start: u32,
+    /// The values `read` found; `params` sends `start` only when they changed,
+    /// so a format-only change leaves each selected section's start alone.
+    #[serde(skip)]
+    orig_start_at: bool,
+    #[serde(skip)]
+    orig_start: u32,
 }
 
 impl PageNumFormatForm {
     pub fn read(app: &WordApp) -> PageNumFormatForm {
         let sp = wordcraft_engine::cmd::page::sect(&app.session);
+        let start_at = sp.page_num_start.is_some();
+        let start = sp.page_num_start.unwrap_or(1).max(1);
         PageNumFormatForm {
             format: sp.page_num_format.ooxml().into(),
-            start_at: sp.page_num_start.is_some(),
-            start: sp.page_num_start.unwrap_or(1).max(1),
+            start_at,
+            start,
+            orig_start_at: start_at,
+            orig_start: start,
         }
     }
 
-    /// `layout.pageNumberFormat` parameters: `start: null` when continuing, which clears a
-    /// custom start; the command leaves the start alone only when the key is absent.
+    /// `layout.pageNumberFormat` parameters: `start` goes out only when the user
+    /// changed the numbering choice or value (`null` when switching to continue,
+    /// which clears a custom start); an untouched start key is absent, and the
+    /// command then leaves every selected section's start alone.
     pub fn params(&self) -> Value {
-        json!({"format": self.format, "start": if self.start_at { json!(self.start) } else { Value::Null }})
+        if self.start_at == self.orig_start_at && self.start == self.orig_start {
+            json!({"format": self.format})
+        } else {
+            json!({"format": self.format, "start": if self.start_at { json!(self.start) } else { Value::Null }})
+        }
     }
 }
 
 fn page_num_format_ui(app: &mut WordApp, ui: &mut Ui, f: &mut PageNumFormatForm) -> bool {
     egui::Grid::new("pnumfmt").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
         ui.label(tl!("Number format:"));
-        let label = PAGE_NUMBER_FORMATS.iter().find(|(v, _)| *v == f.format).map(|(_, l)| *l).unwrap_or(PAGE_NUMBER_FORMATS[0].1);
-        egui::ComboBox::from_id_salt("pnumfmt_fmt").selected_text(tl!(label)).width(180.0).show_ui(ui, |ui| {
+        // A stored format outside PAGE_NUMBER_FORMATS is shown as its own value,
+        // never mislabeled as the first choice.
+        let label = PAGE_NUMBER_FORMATS
+            .iter()
+            .find(|(v, _)| *v == f.format)
+            .map(|(_, l)| tl!(l).to_string())
+            .unwrap_or_else(|| f.format.clone());
+        egui::ComboBox::from_id_salt("pnumfmt_fmt").selected_text(label).width(180.0).show_ui(ui, |ui| {
             for (v, l) in PAGE_NUMBER_FORMATS {
                 ui.selectable_value(&mut f.format, v.to_string(), tl!(l));
             }
@@ -928,6 +950,9 @@ mod tests {
         let LayoutDialog::PageNumFormat(mut f) = form(&mut a) else { panic!("page number format") };
         assert!(f.format == "decimal" && !f.start_at);
         f.format = "lowerRoman".into();
+        // A format-only change sends no start key, so a selection spanning
+        // sections keeps each section's own start.
+        assert_eq!(f.params(), json!({"format": "lowerRoman"}));
         f.start_at = true;
         f.start = 5;
         a.run("layout.pageNumberFormat", f.params()).unwrap();
@@ -941,6 +966,43 @@ mod tests {
         f.start_at = false;
         a.run("layout.pageNumberFormat", f.params()).unwrap();
         assert_eq!(wordcraft_engine::cmd::page::sect(&a.session).page_num_start, None);
+    }
+
+    /// #2827: the ribbon drives the whole flow - Insert > Page Number > Format Page
+    /// Numbers opens the dialog, its controls submit, and the section shows it.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn page_number_format_flow_through_the_ribbon() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .build_ui_state(
+                |ui, app: &mut WordApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app(),
+            );
+        h.run_steps(4);
+        h.get_by_label("Insert").click();
+        h.run_steps(4);
+        h.get_by_label("Page Number").click();
+        h.run_steps(4);
+        h.get_by_label("Format Page Numbers\u{2026}").click();
+        h.run_steps(4);
+        assert!(matches!(&h.state().dialog, Some(crate::dialogs::Dialog::Layout(d)) if matches!(**d, LayoutDialog::PageNumFormat(_))));
+        h.get_by_label("1, 2, 3, \u{2026}").click();
+        h.run_steps(4);
+        h.get_by_label("i, ii, iii, \u{2026}").click();
+        h.run_steps(4);
+        h.get_by_label("Start at:").click();
+        h.run_steps(4);
+        h.get_by_label("OK").click();
+        h.run_steps(4);
+        let sp = wordcraft_engine::cmd::page::sect(&h.state().session);
+        assert_eq!(sp.page_num_format, wordcraft_doc::section::NumFormat::LowerRoman);
+        assert_eq!(sp.page_num_start, Some(1));
     }
 
     /// #755: the Line Numbers "From text" distance and the Hyphenation zone follow the
