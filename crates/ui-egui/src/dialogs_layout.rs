@@ -29,6 +29,7 @@ pub enum LayoutDialog {
     Labels(LabelsForm),
     Formula(FormulaForm),
     Sort(SortForm),
+    PageNumFormat(PageNumFormatForm),
 }
 
 impl LayoutDialog {
@@ -42,6 +43,7 @@ impl LayoutDialog {
             LayoutDialog::Labels(_) => "labels",
             LayoutDialog::Formula(_) => "tableFormula",
             LayoutDialog::Sort(_) => "tableSort",
+            LayoutDialog::PageNumFormat(_) => "pageNumberFormat",
         }
     }
 
@@ -56,6 +58,7 @@ impl LayoutDialog {
             LayoutDialog::Labels(_) => "Labels",
             LayoutDialog::Formula(_) => "Formula",
             LayoutDialog::Sort(_) => "Sort",
+            LayoutDialog::PageNumFormat(_) => "Page Number Format",
         }
     }
 }
@@ -71,6 +74,7 @@ pub fn open(name: &str, app: &mut WordApp) -> Option<LayoutDialog> {
         "labels" => LayoutDialog::Labels(LabelsForm::read(app)),
         "tableFormula" => LayoutDialog::Formula(FormulaForm::read(app)?),
         "tableSort" => LayoutDialog::Sort(SortForm::read(app)?),
+        "pageNumberFormat" => LayoutDialog::PageNumFormat(PageNumFormatForm::read(app)),
         _ => return None,
     })
 }
@@ -86,6 +90,7 @@ pub fn body(app: &mut WordApp, ui: &mut Ui, d: &mut LayoutDialog) -> bool {
         LayoutDialog::Labels(f) => labels_ui(app, ui, f),
         LayoutDialog::Formula(f) => formula_ui(app, ui, f),
         LayoutDialog::Sort(f) => sort_ui(app, ui, f),
+        LayoutDialog::PageNumFormat(f) => page_num_format_ui(app, ui, f),
     }
 }
 
@@ -125,6 +130,70 @@ fn run(app: &mut WordApp, id: &str, params: Value) -> bool {
 
 fn unit() -> wordcraft_geom::Unit {
     crate::options::unit()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page Number Format
+
+/// The page number formats Word's Page Number Format dialog offers, as (command value, label).
+pub const PAGE_NUMBER_FORMATS: [(&str, &str); 5] = [
+    ("decimal", "1, 2, 3, \u{2026}"),
+    ("lowerRoman", "i, ii, iii, \u{2026}"),
+    ("upperRoman", "I, II, III, \u{2026}"),
+    ("lowerLetter", "a, b, c, \u{2026}"),
+    ("upperLetter", "A, B, C, \u{2026}"),
+];
+
+/// The Page Number Format dialog's fields (#2827).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageNumFormatForm {
+    /// An entry of PAGE_NUMBER_FORMATS.
+    pub format: String,
+    /// Start numbering at `start`; off continues the previous section's numbering.
+    pub start_at: bool,
+    pub start: u32,
+}
+
+impl PageNumFormatForm {
+    pub fn read(app: &WordApp) -> PageNumFormatForm {
+        let sp = wordcraft_engine::cmd::page::sect(&app.session);
+        PageNumFormatForm {
+            format: sp.page_num_format.ooxml().into(),
+            start_at: sp.page_num_start.is_some(),
+            start: sp.page_num_start.unwrap_or(1).max(1),
+        }
+    }
+
+    /// `layout.pageNumberFormat` parameters: `start: null` when continuing, which clears a
+    /// custom start; the command leaves the start alone only when the key is absent.
+    pub fn params(&self) -> Value {
+        json!({"format": self.format, "start": if self.start_at { json!(self.start) } else { Value::Null }})
+    }
+}
+
+fn page_num_format_ui(app: &mut WordApp, ui: &mut Ui, f: &mut PageNumFormatForm) -> bool {
+    egui::Grid::new("pnumfmt").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+        ui.label(tl!("Number format:"));
+        let label = PAGE_NUMBER_FORMATS.iter().find(|(v, _)| *v == f.format).map(|(_, l)| *l).unwrap_or(PAGE_NUMBER_FORMATS[0].1);
+        egui::ComboBox::from_id_salt("pnumfmt_fmt").selected_text(tl!(label)).width(180.0).show_ui(ui, |ui| {
+            for (v, l) in PAGE_NUMBER_FORMATS {
+                ui.selectable_value(&mut f.format, v.to_string(), tl!(l));
+            }
+        });
+        ui.end_row();
+    });
+    heading(ui, "Page numbering:");
+    ui.radio_value(&mut f.start_at, false, tl!("Continue from previous section"));
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut f.start_at, true, tl!("Start at:"));
+        ui.add_enabled(f.start_at, egui::DragValue::new(&mut f.start).range(1..=100_000));
+    });
+    let (ok, cancel) = buttons(ui, "OK", true);
+    if ok {
+        return run(app, "layout.pageNumberFormat", f.params());
+    }
+    cancel
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -847,6 +916,31 @@ mod tests {
         let s = &a.session.doc.settings;
         assert!(s.auto_hyphenation && !s.hyphenate_caps && s.consecutive_hyphen_limit == 2);
         assert!((s.hyphenation_zone - 18.0).abs() < 0.01, "zone untouched: {}", s.hyphenation_zone);
+    }
+
+    /// #2827: Insert > Page Number > Format Page Numbers... opens the dialog; OK applies the
+    /// format, "Start at" sets the start, and continuing clears it - the menu item used to run
+    /// the command with `{}`, which wiped a custom start and opened nothing.
+    #[test]
+    fn page_number_format_dialog_applies_choices() {
+        let mut a = app();
+        a.run("ui.dialog", json!({"name": "pageNumberFormat"})).unwrap();
+        let LayoutDialog::PageNumFormat(mut f) = form(&mut a) else { panic!("page number format") };
+        assert!(f.format == "decimal" && !f.start_at);
+        f.format = "lowerRoman".into();
+        f.start_at = true;
+        f.start = 5;
+        a.run("layout.pageNumberFormat", f.params()).unwrap();
+        let sp = wordcraft_engine::cmd::page::sect(&a.session);
+        assert_eq!(sp.page_num_format, wordcraft_doc::section::NumFormat::LowerRoman);
+        assert_eq!(sp.page_num_start, Some(5));
+        // Reopening shows the applied choices; switching to continue clears the custom start.
+        a.run("ui.dialog", json!({"name": "pageNumberFormat"})).unwrap();
+        let LayoutDialog::PageNumFormat(mut f) = form(&mut a) else { panic!("reopen") };
+        assert!(f.format == "lowerRoman" && f.start_at && f.start == 5);
+        f.start_at = false;
+        a.run("layout.pageNumberFormat", f.params()).unwrap();
+        assert_eq!(wordcraft_engine::cmd::page::sect(&a.session).page_num_start, None);
     }
 
     /// #755: the Line Numbers "From text" distance and the Hyphenation zone follow the

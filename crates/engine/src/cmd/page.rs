@@ -77,7 +77,16 @@ pub fn specs() -> Vec<CommandSpec> {
                 if let Some(f) = fmt {
                     x.page_num_format = f;
                 }
-                x.page_num_start = start;
+                match v.get("start") {
+                    // Explicit null: continue the previous section's numbering.
+                    Some(Value::Null) => x.page_num_start = None,
+                    // Key absent: leave the current start alone (#2827).
+                    _ => {
+                        if let Some(st) = start {
+                            x.page_num_start = Some(st);
+                        }
+                    }
+                }
             })
         })
         .params(r#"{"format"?: "decimal|lowerRoman|upperRoman|lowerLetter|upperLetter", "start"?: n}"#),
@@ -871,6 +880,22 @@ mod tests {
         }
         s.run("layout.columns", &json!({"count": 4})).unwrap();
         assert_eq!(columns_preset_at(&s), None);
+    }
+
+    /// #2827: Format Page Numbers with only a format used to wipe a custom start
+    /// back to the default; passing no start must leave page_num_start alone.
+    #[test]
+    fn page_number_format_preserves_start() {
+        let mut s = doc();
+        s.run("layout.pageNumberFormat", &json!({"start": 5})).unwrap();
+        assert_eq!(sect(&s).page_num_start, Some(5));
+        s.run("layout.pageNumberFormat", &json!({"format": "lowerRoman"})).unwrap();
+        let x = sect(&s);
+        assert_eq!(x.page_num_start, Some(5));
+        assert_eq!(x.page_num_format, wordcraft_doc::section::NumFormat::LowerRoman);
+        // An explicit null start continues the previous section's numbering.
+        s.run("layout.pageNumberFormat", &json!({"start": null})).unwrap();
+        assert_eq!(sect(&s).page_num_start, None);
     }
 
     /// #852: a continuous section break with text selected goes before the selection and keeps
